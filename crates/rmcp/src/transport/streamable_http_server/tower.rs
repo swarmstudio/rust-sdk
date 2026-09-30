@@ -1594,7 +1594,13 @@ where
             .ok()
             .and_then(|service| service.get_tool(name))
             .map(|tool| tool.input_schema);
-        if let Ok(mut cache) = self.tool_schemas.write() {
+        // Only a tool the server knows is cached. The name comes from the request,
+        // so caching misses would let any client grow this process-wide map without
+        // bound — one entry per distinct name it cares to send. A miss is re-asked
+        // of `get_tool`, which is the server's own, cheap answer.
+        if schema.is_some()
+            && let Ok(mut cache) = self.tool_schemas.write()
+        {
             cache.insert(name.to_owned(), schema.clone());
         }
         schema
@@ -2458,5 +2464,62 @@ impl<S: Stream> Stream for CancelOnDisconnect<S> {
             *this.ct = None;
         }
         polled
+    }
+}
+
+#[cfg(test)]
+mod tool_schema_cache_tests {
+    use super::*;
+    use crate::{
+        ServerHandler,
+        model::{ServerCapabilities, ServerConfig, Tool},
+        transport::streamable_http_server::session::never::NeverSessionManager,
+    };
+
+    /// Knows exactly one tool, so every other name is a miss.
+    #[derive(Clone)]
+    struct OneTool;
+
+    impl ServerHandler for OneTool {
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        }
+
+        fn get_tool(&self, name: &str) -> Option<Tool> {
+            (name == "deploy").then(|| {
+                let schema = serde_json::json!({"type": "object"});
+                let schema = schema.as_object().expect("object schema").clone();
+                Tool::new("deploy", "deploy a thing", Arc::new(schema))
+            })
+        }
+    }
+
+    fn service() -> StreamableHttpService<OneTool, NeverSessionManager> {
+        StreamableHttpService::new(
+            || Ok(OneTool),
+            Arc::new(NeverSessionManager::default()),
+            StreamableHttpServerConfig::default(),
+        )
+    }
+
+    fn cached(service: &StreamableHttpService<OneTool, NeverSessionManager>) -> usize {
+        service.tool_schemas.read().expect("cache lock").len()
+    }
+
+    #[test]
+    fn names_the_server_does_not_know_are_never_cached() {
+        let service = service();
+        for i in 0..1_000 {
+            assert!(service.tool_schema(&format!("unknown_{i}")).is_none());
+        }
+        assert_eq!(cached(&service), 0, "a miss must not grow the cache");
+    }
+
+    #[test]
+    fn a_known_tool_is_cached_once_and_served_from_the_cache() {
+        let service = service();
+        assert!(service.tool_schema("deploy").is_some());
+        assert!(service.tool_schema("deploy").is_some());
+        assert_eq!(cached(&service), 1);
     }
 }
